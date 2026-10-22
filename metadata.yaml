@@ -1,0 +1,9 @@
+name: astrbot_plugin_lively_report
+display_name: 每日彙報
+desc: 每天私信主人彙報：聊了多少、認識了誰、群裡發生了啥、心情和社交動態
+version: 2.0.0
+author: GUCine
+repo: https://github.com/GUCine/astrbot_plugin_lively_report
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.29.0"

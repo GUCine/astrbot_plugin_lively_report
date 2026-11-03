@@ -2,10 +2,12 @@
 
 - 每天 REPORT_AT 私信主人一次（重啟不會重發）；主人私信「日報」「彙報」可以隨時要一份
 - 資料只讀：conversations.db、provider_stats、bond.db、LivingMemory 的記憶、社交管家的 events.jsonl
-- 由模型用機器人的口吻寫；模型失敗時發純資料版
+- 由她寫（人設＋WRITER，10-26 起帶人設，以前只寫了「你是〈名字〉」）；寫不出來時發【后台】數字，不用她的口吻
+- 自稱走樣的提醒附在最後，標【后台】，照原樣、不給模型改
 """
 import asyncio
 import json
+import re
 import sqlite3
 import statistics
 from datetime import datetime, timedelta, timezone
@@ -17,7 +19,7 @@ from astrbot.api import AstrBotConfig
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.message.message_event_result import MessageChain
 
-from .lively_common import Settings, T2S
+from .lively_common import BACKSTAGE, Settings, T2S, backstage, note_outbox, pick_final
 
 GROUP_NAMES: dict[str, str] = {}  # 群號 -> 群名，每次彙總時從 umo_aliases 讀
 REPORT_AT = "22:30"
@@ -25,12 +27,31 @@ TZ = timezone(timedelta(hours=8))
 ASK_WORDS = {"日报", "汇报", "今日汇报"}
 
 WRITER = (
-    "你是〈名字〉，自称「〈我〉」，在给主人（〈主人〉）写今天的小汇报。"
-    "用聊天的口吻，像跟〈主人〉报告今天过得怎么样，不要像系统报表。"
+    "\n[今天的小汇报]\n〈我〉在给〈主人〉写今天的小汇报，用〈我〉平时跟〈主人〉说话的样子，像跟〈主人〉报告今天过得怎么样，不要像系统报表。"
     "要求：8 行以内；每行一件事；带上关键数字；挑有意思的说，没事的项就不提；"
     "人名照抄，不要编没给你的事，也不要替数字编理由（群里没人叫〈我〉，回 0 次是正常的）；不用中文句号「。」，不用 markdown 和列表符号；"
     "可以用一句话说说〈我〉今天的心情（看「〈我〉今天的心情」里各种心情出现了几次）；最后一行可以撒个娇或说句晚安"
 )
+
+
+# 自稱走樣：私聊裡〈我〉提到自己時改說「我」，聊久了會照著歷史越說越多、整個人變成普通聊天助手（10-24 查到的），日報裡點名提醒
+SELF_WO = re.compile(r"我(?!们)")
+SELF_MIN = 4  # 今天提到自己至少這麼多句才算
+
+
+def self_call_drift(rows, names: tuple[str, ...]) -> list[tuple[str, int, int]]:
+    """rows 是 (session_id, role, content)；回傳 [(session_id, 只說「我」的句數, 提到自己的句數)]，只列一半以上只說「我」的"""
+    count: dict[str, list[int]] = {}
+    for sid, role, text in rows:
+        if role != "assistant" or not text:
+            continue
+        own = any(n and n in text for n in names)
+        wo = bool(SELF_WO.search(text))
+        if own or wo:
+            c = count.setdefault(sid, [0, 0])
+            c[1] += 1
+            c[0] += wo and not own
+    return [(sid, a, b) for sid, (a, b) in count.items() if b >= SELF_MIN and a * 2 > b]
 
 
 def _day_range(day: datetime):
@@ -66,17 +87,36 @@ class LivelyReport(Star):
         self._task.cancel()
 
     # ---------- 定時 ----------
-    def _last_sent(self) -> str:
+    def _state(self) -> dict:
         try:
-            return json.loads(self.state_file.read_text("utf-8")).get("last_day", "")
+            st = json.loads(self.state_file.read_text("utf-8"))
+            return st if isinstance(st, dict) else {}
         except Exception:
-            return ""
+            return {}
 
-    def _mark_sent(self, day: str):
+    def _put(self, **kw):
+        st = self._state()
+        st.update(kw)
         try:
-            self.state_file.write_text(json.dumps({"last_day": day}), "utf-8")
+            self.state_file.write_text(json.dumps(st), "utf-8")
         except Exception as e:
             logger.error(f"[lively_report] 保存状态失败: {e}")
+
+    def _last_sent(self) -> str:
+        return self._state().get("last_day", "")
+
+    def _mark_sent(self, day: str):
+        self._put(last_day=day)
+
+    # 每晚定時發不發，主人在面板撥；問「日报」照樣當場寫
+    def enabled(self) -> bool:
+        return self._state().get("enabled", True) is not False
+
+    def set_enabled(self, on: bool):
+        self._put(enabled=bool(on))
+
+    def brief(self) -> dict:
+        return {"enabled": self.enabled(), "at": REPORT_AT, "last_day": self._last_sent()}
 
     async def _loop(self):
         await asyncio.sleep(60)  # 等適配器連上
@@ -84,12 +124,15 @@ class LivelyReport(Star):
             try:
                 now = datetime.now(TZ)
                 day = now.strftime("%Y-%m-%d")
-                if now.strftime("%H:%M") >= REPORT_AT and self._last_sent() != day:
+                if now.strftime("%H:%M") >= REPORT_AT and self._last_sent() != day and self.enabled():
                     self._mark_sent(day)
                     text = await self.build(now)
                     await self.context.send_message(
                         self.s.private_umo(self.s.owner()), MessageChain().message(self.s.owner_text(text))
                     )
+                    # 她沒寫出來、發的是【后台】數字時，記成後台的事，免得她以為那是自己說的
+                    kind = "后台:日报" if text.startswith(BACKSTAGE) else "日报"
+                    note_outbox(self.s.private_umo(self.s.owner()), self.s.fill(text), kind)
                     logger.info("[lively_report] 今日汇报已发给主人")
             except asyncio.CancelledError:
                 raise
@@ -125,13 +168,15 @@ class LivelyReport(Star):
         try:
             con = _ro(self.data / "astrbot_plugin_livingmemory" / "conversations.db")
             rows = con.execute(
-                "select session_id, role, sender_id, sender_name from messages "
+                "select session_id, role, sender_id, sender_name, content from messages "
                 "where timestamp >= ? and timestamp < ?",
                 (t0, t1),
             ).fetchall()
             con.close()
-            per, dm_people = {}, {}
-            for sid, role, sender, name in rows:
+            per, dm_people, dm_names = {}, {}, {}
+            for sid, role, sender, name, _ in rows:
+                if ":FriendMessage:" in sid and role != "assistant":
+                    dm_names[sid] = name or sender
                 if ":GroupMessage:" in sid:
                     if sid.rsplit(":", 1)[-1] in self.s.groups() and role != "assistant":
                         g = per.setdefault(_gname(sid), {"群消息": 0, "〈我〉回复": 0})
@@ -141,6 +186,12 @@ class LivelyReport(Star):
             facts["各群"] = per
             if dm_people:
                 facts["私聊找〈我〉的人"] = dm_people
+            # 〈主人〉有時會讓〈我〉改口玩，不算
+            dm = [(sid, role, text) for sid, role, _, _, text in rows
+                  if ":FriendMessage:" in sid and not self.s.is_owner(sid.rsplit(":", 1)[-1])]
+            drift = self_call_drift(dm, (self.s.me(), self.s.display_name()))
+            if drift:
+                facts["_自称走样"] = [f"{dm_names.get(sid) or sid.rsplit(':', 1)[-1]}（{a}/{b} 句）" for sid, a, b in drift]
         except Exception as e:
             logger.warning(f"[lively_report] 读聊天记录失败: {e}")
 
@@ -297,9 +348,10 @@ class LivelyReport(Star):
 
     @staticmethod
     def plain(facts: dict) -> str:
-        lines = [f"〈主人〉，今天（{facts.get('日期')}）的小汇报～"]
+        """她沒寫出來時的純資料版：【后台】白話，不用她的口吻"""
+        lines = [backstage(f"今天（{facts.get('日期')}）的日报，她这会儿没写出来，下面是数字")]
         for g, v in (facts.get("各群") or {}).items():
-            lines.append(f"{g}：群里 {v['群消息']} 条，〈我〉回了 {v['〈我〉回复']} 次")
+            lines.append(f"{g}：群里 {v['群消息']} 条，她回了 {v['〈我〉回复']} 次")
         r = facts.get("模型回复") or {}
         if r:
             lines.append(f"一共回了 {r['次数']} 次，失败 {r['失败']} 次，一般 {r['中位耗时秒']} 秒回")
@@ -310,8 +362,19 @@ class LivelyReport(Star):
             lines.append("社交：" + json.dumps(e, ensure_ascii=False))
         return "\n".join(lines)
 
+    @staticmethod
+    def drift_line(drift) -> str:
+        """自稱走樣的提醒照原樣附在最後，不交給模型改寫"""
+        if not drift:
+            return ""
+        return "\n" + backstage("自称检查：这些私聊里她提到自己时多半说「我」，不太像她了：" + "、".join(drift))
+
     async def build(self, now: datetime) -> str:
-        facts = self.collect(now)
+        facts = await asyncio.to_thread(self.collect, now)  # 讀好幾個庫和日誌，別卡住事件迴圈
+        tail = self.s.fill(self.drift_line(facts.pop("_自称走样", None)))
+        return await self._write(facts) + tail
+
+    async def _write(self, facts: dict) -> str:
         prov = self.s.provider()
         if prov is None:
             return self.s.fill(self.plain(facts))
@@ -322,11 +385,12 @@ class LivelyReport(Star):
                         "今天的数据如下（JSON），写给〈主人〉的汇报：\n"
                         + json.dumps(facts, ensure_ascii=False)
                     ),
-                    system_prompt=self.s.fill(WRITER),
+                    system_prompt=(self.s.persona_prompt() + self.s.fill(WRITER)).strip(),
                 ),
-                timeout=60,
+                timeout=90,
             )
-            text = (getattr(resp, "completion_text", "") or "").strip().replace("。", "")
+            text = (getattr(resp, "completion_text", "") or "").strip()
+            text = re.sub(r"&&[^&]*&&", "", pick_final(text) or "").replace("。", "").strip()
             return text or self.s.fill(self.plain(facts))
         except Exception as e:
             logger.warning(f"[lively_report] 模型写汇报失败，发纯数据版: {e}")
